@@ -1,4 +1,4 @@
-# NixerNodeFull
+# Nixer
 
 `NixerNodeFull` is the start of a real NodeJS backend port for `Nixer`.
 
