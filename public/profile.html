@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nixer Profile</title>
+    <style>
+        body {
+            background:
+                radial-gradient(circle at top, rgba(80, 95, 255, 0.16), transparent 30%),
+                #090b10;
+            color: #c9d1d9;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+        .container {
+            background: linear-gradient(180deg, rgba(20, 23, 32, 0.98), rgba(10, 12, 18, 0.98));
+            padding: 2rem;
+            border-radius: 24px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            box-shadow: 0 24px 80px rgba(0, 0, 0, 0.45);
+            text-align: center;
+            width: 100%;
+            max-width: 420px;
+        }
+        img {
+            width: 150px;
+            height: 150px;
+            border-radius: 50%;
+            object-fit: cover;
+            border: 2px solid rgba(164, 147, 255, 0.7);
+            box-shadow: 0 0 0 6px rgba(255, 255, 255, 0.03);
+            margin-bottom: 1rem;
+        }
+        button {
+            background: linear-gradient(135deg, #6f6bff, #4091ff);
+            color: white;
+            border: none;
+            padding: 12px 20px;
+            border-radius: 14px;
+            cursor: pointer;
+            font-size: 1rem;
+            font-weight: bold;
+            transition: transform 0.2s, opacity 0.2s;
+            margin-top: 1rem;
+            width: 100%;
+        }
+        button:hover {
+            transform: translateY(-1px);
+        }
+        input[type="file"] {
+            display: none;
+        }
+        .upload-btn {
+            background: rgba(255, 255, 255, 0.04);
+            color: #c9d1d9;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            padding: 12px 16px;
+            border-radius: 14px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            display: inline-block;
+            width: 100%;
+            box-sizing: border-box;
+            margin-bottom: 1rem;
+            transition: background-color 0.2s;
+        }
+        .upload-btn:hover {
+            background: rgba(255, 255, 255, 0.08);
+        }
+        .error {
+            color: #ff8d8d;
+            margin-top: 10px;
+            font-size: 0.9rem;
+        }
+        .success {
+            color: #7ff0a5;
+            margin-top: 10px;
+            font-size: 0.9rem;
+        }
+        .field {
+            text-align: left;
+            margin-bottom: 1rem;
+        }
+        .field label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-size: 0.9rem;
+            color: #9da5bb;
+        }
+        .field input[type="text"] {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 12px 14px;
+            border-radius: 14px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            background: rgba(255, 255, 255, 0.03);
+            color: #f0f6fc;
+            font-size: 1rem;
+        }
+        .field input[type="text"]:focus {
+            outline: none;
+            border-color: rgba(126, 149, 255, 0.75);
+            box-shadow: 0 0 0 3px rgba(97, 127, 255, 0.14);
+        }
+        h2 {
+            margin-top: 0;
+            color: white;
+        }
+        p {
+            margin-top: 0;
+            margin-bottom: 1.5rem;
+            color: #8c93a8;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>Edit Profile</h2>
+    <p>Update your local username and avatar for this NodeFull client.</p>
+    <img id="avatar-preview" src="" alt="Avatar" style="display: none;">
+    <div class="field">
+        <label for="username-input">Username</label>
+        <input type="text" id="username-input" maxlength="40" placeholder="Your username">
+    </div>
+    <label for="avatar-upload" class="upload-btn">Choose a new avatar</label>
+    <input type="file" id="avatar-upload" accept="image/png,image/jpeg,image/webp,image/gif">
+    
+    <button id="save-btn">Save changes</button>
+    
+    <div id="message" class="error"></div>
+</div>
+
+<script>
+    const MAX_SIZE = 2 * 1024 * 1024;
+    let avatarData = "";
+
+    fetch('/api/v1/status')
+        .then(res => res.json())
+        .then(data => {
+            const user = data.data.user;
+            if (user && !user.isSimulated) {
+                document.getElementById('username-input').value = user.viewer?.name || '';
+                if (user.viewer.avatar && user.viewer.avatar.large) {
+                    const img = document.getElementById('avatar-preview');
+                    img.src = user.viewer.avatar.large;
+                    img.style.display = 'inline-block';
+                }
+            }
+        })
+        .catch(console.error);
+
+    document.getElementById('avatar-upload').addEventListener('change', (e) => {
+        const file = e.target.files[0];
+        const msg = document.getElementById('message');
+        msg.className = 'error';
+        msg.textContent = '';
+        
+        if (!file) return;
+
+        if (file.size > MAX_SIZE) {
+            msg.textContent = 'The image must be smaller than 2 MB.';
+            return;
+        }
+
+        const reader = new FileReader();
+        reader.onload = () => {
+            avatarData = reader.result;
+            const img = document.getElementById('avatar-preview');
+            img.src = avatarData;
+            img.style.display = 'inline-block';
+            document.getElementById('save-btn').style.display = 'block';
+        };
+        reader.readAsDataURL(file);
+    });
+
+    document.getElementById('save-btn').addEventListener('click', () => {
+        const username = document.getElementById('username-input').value.trim();
+        const msg = document.getElementById('message');
+        msg.textContent = '';
+        msg.className = 'error';
+        if (!username) {
+            msg.textContent = 'Username cannot be empty.';
+            return;
+        }
+        
+        fetch('/api/v1/auth/update', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ username, avatarData })
+        })
+        .then(res => res.json())
+        .then(data => {
+            if (data.error) {
+                msg.className = 'error';
+                msg.textContent = data.error;
+            } else {
+                msg.className = 'success';
+                msg.textContent = 'Profile updated. You can close this tab now.';
+                document.getElementById('save-btn').style.display = 'none';
+            }
+        })
+        .catch(err => {
+            msg.className = 'error';
+            msg.textContent = 'Saving failed.';
+        });
+    });
+</script>
+
+</body>
+</html>

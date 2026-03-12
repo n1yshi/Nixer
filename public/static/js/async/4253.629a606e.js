@@ -1,0 +1,1 @@
+"use strict";(self.webpackChunknixer_web=self.webpackChunknixer_web||[]).push([["4253"],{83596(e,s,r){function n(){throw Error("This is a test error")}r.r(s),r.d(s,{component:()=>n})}}]);

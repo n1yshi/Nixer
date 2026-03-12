@@ -1,0 +1,24 @@
+{
+  "name": "nixer-webpanel",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser-only webpanel + Node server",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.2",
+    "better-sqlite3": "^11.10.0",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "multer": "^1.4.5-lts.2",
+    "uuid": "^11.1.0",
+    "ws": "^8.18.1"
+  }
+}
+
