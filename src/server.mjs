@@ -11,25 +11,33 @@ import cors from "cors"
 import express from "express"
 import { v4 as uuidv4 } from "uuid"
 
-import { getAnimeDetails, listAnime, listRecentAnime } from "./anilist-client.mjs"
+import { getAnimeDetails, getMangaDetails, listAnime, listManga, listRecentAnime } from "./anilist-client.mjs"
 import { getConfig } from "./config.mjs"
 import {
   createDb,
   getContinuityWatchHistory,
   getContinuityWatchHistoryItem,
+  deleteMangaMapping,
   deleteLocalAnimeEntry,
+  deleteLocalMangaEntry,
   getAccount,
   getLocalAnimeEntries,
   getLocalAnimeEntry,
+  getLocalMangaEntries,
+  getLocalMangaEntry,
+  getMangaMapping,
   getSettings,
   getTheme,
   saveAccount,
   saveSettings,
   saveTheme,
   upsertContinuityWatchHistoryItem,
-  upsertLocalAnimeEntry
+  upsertMangaMapping,
+  upsertLocalAnimeEntry,
+  upsertLocalMangaEntry
 } from "./db.mjs"
 import { buildAnimeCollection, buildAnimeEntry, buildLibraryCollection, buildLocalStats, buildRemoteAnimeEntry } from "./local-anime.mjs"
+import { buildLocalMangaCollection, buildMangaCollection } from "./local-manga.mjs"
 import { defaultHomeItems } from "./defaults.mjs"
 import {
   fetchExternalExtensionData,
@@ -53,9 +61,27 @@ import {
   updateExtensionCode
 } from "./extensions-repo.mjs"
 import { getOnlineStreamEpisodeList, getOnlineStreamEpisodeSource, listRuntimeOnlinestreamProviderExtensions } from "./onlinestream-engine.mjs"
+import { findMangaChapterPages, findMangaChapters, searchManga } from "./manga-engine.mjs"
+import {
+  getTorrentInfoHash,
+  getTorrentMagnetLink,
+  normalizeTorrentProviderMedia,
+  searchAnimeTorrents,
+} from "./torrent-engine.mjs"
 import { logError, logInfo, logWarn } from "./logging.mjs"
+import { registerGeneratedApiStubs } from "./generated-api-stubs.mjs"
+import { clearLogLines, getLogFilenames, getLogText } from "./logs-store.mjs"
+import { getQbittorrentConfigFromSettings, QbittorrentClient } from "./qbittorrent-client.mjs"
 import { dataResponse } from "./response.mjs"
 import { getStatus } from "./state.mjs"
+import {
+  getDebridSettings,
+  getMediastreamSettings,
+  getTorrentstreamSettings,
+  saveDebridSettings,
+  saveMediastreamSettings,
+  saveTorrentstreamSettings,
+} from "./secondary-settings.mjs"
 import { LOCAL_USER_TOKEN, newLocalUser } from "./user.mjs"
 import { attachWebsocket } from "./ws.mjs"
 
@@ -69,6 +95,7 @@ app.set("etag", false)
 
 const recentRequestBuckets = new Map()
 const REQUEST_LOG_WINDOW_MS = 1500
+let qbClientCache = { key: "", client: null }
 
 process.on("unhandledRejection", (reason) => {
   logError("app", "unhandledRejection", reason)
@@ -134,10 +161,90 @@ app.use((req, res, next) => {
 
 app.use("/assets/profiles", express.static(config.uploadsDir))
 app.use(express.static(config.publicDir, { index: false }))
+app.use("/manga-downloads", express.static(path.join(config.dataDir, "manga-downloads")))
 
 app.get("/healthz", (_req, res) => {
   res.json({ ok: true, app: "NixerNodeFull" })
 })
+
+app.get("/api/v1/image-proxy", wrapRoute(async (req, res) => {
+  const targetUrl = String(req.query?.url || "").trim()
+  if (!targetUrl) {
+    throw new Error("url is required")
+  }
+
+  let headerMap = {}
+  const rawHeaders = String(req.query?.headers || "").trim()
+  if (rawHeaders) {
+    try {
+      const parsed = JSON.parse(rawHeaders)
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        headerMap = parsed
+      }
+    } catch {
+      throw new Error("headers must be valid JSON")
+    }
+  }
+
+  const upstreamHeaders = buildProxyRequestHeaders(headerMap, req)
+  upstreamHeaders.set("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
+
+  const response = await fetchProxyTarget(targetUrl, upstreamHeaders)
+  if (!response.ok) {
+    throw new Error(`failed to proxy image (${response.status})`)
+  }
+
+  for (const [key, value] of response.headers.entries()) {
+    const lowerKey = key.toLowerCase()
+    if (
+      lowerKey === "content-length" ||
+      lowerKey === "content-encoding" ||
+      lowerKey === "transfer-encoding" ||
+      lowerKey === "connection"
+    ) {
+      continue
+    }
+    res.setHeader(key, value)
+  }
+
+  res.setHeader("Access-Control-Allow-Origin", "*")
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate")
+  res.status(200)
+
+  if (!response.body) {
+    res.end()
+    return
+  }
+
+  Readable.fromWeb(response.body).pipe(res)
+}))
+
+app.get("/api/v1/manga/local-page/:path", wrapRoute(async (req, res) => {
+  const encoded = String(req.params.path || "")
+  const decoded = safeDecodeURIComponent(encoded)
+
+  const raw = decoded.startsWith("{{manga-local-assets}}")
+    ? decoded.slice("{{manga-local-assets}}".length)
+    : decoded
+
+  const relative = raw.replace(/^\/+/, "")
+  const baseDir = path.join(config.dataDir, "manga-local-assets")
+  const resolved = path.resolve(baseDir, relative)
+  if (!resolved.startsWith(path.resolve(baseDir) + path.sep)) {
+    const error = new Error("forbidden path")
+    error.status = 403
+    throw error
+  }
+
+  if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
+    const error = new Error("not found")
+    error.status = 404
+    throw error
+  }
+
+  res.setHeader("Access-Control-Allow-Origin", "*")
+  res.sendFile(resolved)
+}))
 
 app.get("/api/v1/status", wrapRoute((req, res) => {
   res.json(dataResponse(getStatus({ db, config, req })))
@@ -145,6 +252,36 @@ app.get("/api/v1/status", wrapRoute((req, res) => {
 
 app.get("/api/v1/settings", wrapRoute((_req, res) => {
   res.json(dataResponse(getSettings(db)))
+}))
+
+app.get("/api/v1/mediastream/settings", (_req, res) => {
+  res.json(dataResponse(getMediastreamSettings(config)))
+})
+
+app.patch("/api/v1/mediastream/settings", wrapRoute((req, res) => {
+  const next = saveMediastreamSettings(config, req.body)
+  notifySyncStateChanged("mediastream-settings")
+  res.json(dataResponse(next))
+}))
+
+app.get("/api/v1/torrentstream/settings", (_req, res) => {
+  res.json(dataResponse(getTorrentstreamSettings(config)))
+})
+
+app.patch("/api/v1/torrentstream/settings", wrapRoute((req, res) => {
+  const next = saveTorrentstreamSettings(config, req.body)
+  notifySyncStateChanged("torrentstream-settings")
+  res.json(dataResponse(next))
+}))
+
+app.get("/api/v1/debrid/settings", (_req, res) => {
+  res.json(dataResponse(getDebridSettings(config)))
+})
+
+app.patch("/api/v1/debrid/settings", wrapRoute((req, res) => {
+  const next = saveDebridSettings(config, req.body)
+  notifySyncStateChanged("debrid-settings")
+  res.json(dataResponse(next))
 }))
 
 app.get("/api/v1/theme", wrapRoute((_req, res) => {
@@ -210,6 +347,99 @@ app.post("/api/v1/announcements", (_req, res) => {
   res.json(dataResponse([]))
 })
 
+app.get("/api/v1/logs/filenames", (_req, res) => {
+  res.json(dataResponse(getLogFilenames()))
+})
+
+app.delete("/api/v1/logs", wrapRoute((req, res) => {
+  const filenames = Array.isArray(req.body?.filenames) ? req.body.filenames.map(String) : []
+  if (!filenames.length || filenames.includes("runtime.log")) {
+    clearLogLines()
+  }
+  res.json(dataResponse(true))
+}))
+
+app.get("/api/v1/logs/latest", (_req, res) => {
+  res.json(dataResponse(getLogText()))
+})
+
+app.get("/api/v1/log/*", (req, res) => {
+  const filename = String(req.params[0] || "").trim()
+  if (filename && filename !== "runtime.log") {
+    res.json(dataResponse(""))
+    return
+  }
+  res.json(dataResponse(getLogText()))
+})
+
+app.get("/api/v1/memory/stats", (_req, res) => {
+  const usage = process.memoryUsage()
+  res.json(dataResponse({
+    rss: usage.rss,
+    heapTotal: usage.heapTotal,
+    heapUsed: usage.heapUsed,
+    external: usage.external,
+    arrayBuffers: usage.arrayBuffers,
+    uptimeSeconds: Math.round(process.uptime()),
+  }))
+})
+
+app.get("/api/v1/memory/profile", (_req, res) => {
+  res.status(501).json({ error: "memory profiles are not supported in Node mode" })
+})
+
+app.get("/api/v1/memory/goroutine", (_req, res) => {
+  res.status(501).json({ error: "goroutine profiles are not supported in Node mode" })
+})
+
+app.get("/api/v1/memory/cpu", (_req, res) => {
+  res.status(501).json({ error: "cpu profiles are not supported in Node mode" })
+})
+
+app.post("/api/v1/memory/gc", (_req, res) => {
+  if (typeof global.gc === "function") {
+    global.gc()
+  }
+  res.json(dataResponse(true))
+})
+
+app.get("/api/v1/filecache/total-size", wrapRoute(async (_req, res) => {
+  const cacheDir = path.join(config.dataDir, "cache")
+  const size = await getDirectorySizeBytes(cacheDir)
+  res.json(dataResponse(formatBytes(size)))
+}))
+
+app.delete("/api/v1/filecache/bucket", wrapRoute((req, res) => {
+  const bucket = String(req.body?.bucket || "")
+  if (!bucket) {
+    throw new Error("bucket is required")
+  }
+  const cacheDir = path.join(config.dataDir, "cache")
+  fs.mkdirSync(cacheDir, { recursive: true })
+  for (const filename of fs.readdirSync(cacheDir)) {
+    if (!filename.startsWith(bucket)) continue
+    const target = path.join(cacheDir, filename)
+    try {
+      fs.rmSync(target, { recursive: true, force: true })
+    } catch {
+    }
+  }
+  res.json(dataResponse(true))
+}))
+
+app.get("/api/v1/filecache/mediastream/videofiles/total-size", wrapRoute(async (_req, res) => {
+  const dir = path.join(config.dataDir, "cache", "mediastream-videofiles")
+  const size = await getDirectorySizeBytes(dir)
+  res.json(dataResponse(formatBytes(size)))
+}))
+
+app.delete("/api/v1/filecache/mediastream/videofiles", wrapRoute((req, res) => {
+  const dir = path.join(config.dataDir, "cache", "mediastream-videofiles")
+  fs.rmSync(dir, { recursive: true, force: true })
+  fs.mkdirSync(dir, { recursive: true })
+  res.json(dataResponse(true))
+}))
+
 app.get("/api/v1/extensions/list", (_req, res) => {
   res.json(dataResponse(listExtensionData(config)))
 })
@@ -234,24 +464,238 @@ app.get("/api/v1/extensions/list/custom-source", (_req, res) => {
   res.json(dataResponse(listCustomSourceExtensions(config)))
 })
 
-app.get("/api/v1/torrent-client/list", (_req, res) => {
-  res.json(dataResponse([]))
-})
+app.post("/api/v1/torrent/search", wrapRoute(async (req, res) => {
+  const body = req.body && typeof req.body === "object" ? req.body : {}
+  const requestedProvider = String(body.provider || "").trim()
+  const settings = getSettings(db)
+  const fallbackProvider = String(settings?.library?.torrentProvider || "").trim()
+  const installedProviders = listAnimeTorrentProviderExtensions(config)
+  const providerId = requestedProvider && requestedProvider !== "none"
+    ? requestedProvider
+    : (fallbackProvider && fallbackProvider !== "none" ? fallbackProvider : (installedProviders[0]?.id || ""))
+
+  if (!providerId) {
+    res.json(dataResponse({
+      torrents: [],
+      previews: [],
+      torrentMetadata: {},
+      debridInstantAvailability: {},
+      animeMetadata: null,
+      includedSpecialProviders: [],
+    }))
+    return
+  }
+
+  const media = normalizeTorrentProviderMedia(body.media)
+  if (body.absoluteOffset !== undefined) {
+    media.absoluteSeasonOffset = Number(body.absoluteOffset || 0) || 0
+  }
+
+  const torrents = await searchAnimeTorrents(config, providerId, {
+    type: body.type,
+    query: body.query,
+    episodeNumber: body.episodeNumber,
+    batch: body.batch,
+    resolution: body.resolution,
+    bestRelease: body.bestRelease,
+    media,
+  })
+
+  res.json(dataResponse({
+    torrents,
+    previews: [],
+    torrentMetadata: {},
+    debridInstantAvailability: {},
+    animeMetadata: null,
+    includedSpecialProviders: [],
+  }))
+}))
+
+app.get("/api/v1/torrent-client/list", wrapRoute(async (req, res) => {
+  const qb = getQbClient(db)
+  if (!qb) {
+    res.json(dataResponse([]))
+    return
+  }
+  const category = req.query?.category ? String(req.query.category) : ""
+  const sort = req.query?.sort ? String(req.query.sort) : ""
+  const list = await qb.listTorrents({ category, sort })
+  res.json(dataResponse(list))
+}))
+
+app.post("/api/v1/torrent-client/action", wrapRoute(async (req, res) => {
+  const qb = getQbClient(db)
+  if (!qb) {
+    throw new Error("torrent client not configured")
+  }
+
+  const body = req.body && typeof req.body === "object" ? req.body : {}
+  const hash = String(body.hash || "").trim()
+  const action = String(body.action || "").trim()
+  const dir = String(body.dir || "").trim()
+  if (!hash || !action) throw new Error("missing arguments")
+
+  switch (action) {
+    case "pause":
+      await qb.pauseTorrents([hash])
+      break
+    case "resume":
+      await qb.resumeTorrents([hash])
+      break
+    case "remove":
+      await qb.removeTorrents([hash], { deleteFiles: false })
+      break
+    case "open":
+      if (!dir) throw new Error("directory not found")
+      break
+    default:
+      throw new Error("unknown action")
+  }
+
+  res.json(dataResponse(true))
+}))
+
+app.post("/api/v1/torrent-client/get-files", wrapRoute(async (req, res) => {
+  const qb = getQbClient(db)
+  if (!qb) {
+    throw new Error("torrent client not configured")
+  }
+
+  const body = req.body && typeof req.body === "object" ? req.body : {}
+  const providerId = String(body.provider || body?.torrent?.provider || "").trim()
+  const torrent = body?.torrent && typeof body.torrent === "object" ? body.torrent : null
+  if (!torrent) throw new Error("torrent is required")
+
+  let infoHash = String(torrent.infoHash || "").trim()
+  if (!infoHash && providerId) {
+    infoHash = await getTorrentInfoHash(config, providerId, torrent)
+    torrent.infoHash = infoHash
+  }
+  if (!infoHash) throw new Error("torrent infoHash is required")
+
+  const torrentstreamSettings = getTorrentstreamSettings(config)
+  const allowServerTempStorage = Boolean(String(torrentstreamSettings?.downloadDir || "").trim())
+
+  const exists = await qb.torrentExists(infoHash)
+  let tempAdded = false
+  if (!exists) {
+    if (!allowServerTempStorage) {
+      res.json(dataResponse([]))
+      return
+    }
+    if (!providerId) throw new Error("provider is required to add torrent")
+    const magnet = await getTorrentMagnetLink(config, providerId, torrent)
+    if (!magnet) throw new Error("magnet link not found")
+    await qb.addMagnets([magnet], "/tmp/nixer-torrent-inspect", { paused: true })
+    tempAdded = true
+
+    const startedAt = Date.now()
+    while (Date.now() - startedAt < 15000) {
+      if (await qb.torrentExists(infoHash)) break
+      await waitMs(400)
+    }
+  }
+
+  const files = await qb.getFiles(infoHash)
+  const names = files.map((file) => String(file?.name || file?.path || "")).filter(Boolean)
+
+  if (tempAdded) {
+    try {
+      await qb.removeTorrents([infoHash], { deleteFiles: true })
+    } catch {
+      // ignore cleanup errors
+    }
+  }
+
+  res.json(dataResponse(names))
+}))
+
+app.post("/api/v1/torrent-client/download", wrapRoute(async (req, res) => {
+  const qb = getQbClient(db)
+  if (!qb) {
+    throw new Error("torrent client not configured")
+  }
+
+  const body = req.body && typeof req.body === "object" ? req.body : {}
+  const torrents = Array.isArray(body.torrents) ? body.torrents : []
+  const torrentstreamSettings = getTorrentstreamSettings(config)
+  const settings = getSettings(db)
+
+  const requestedDestination = String(body.destination || "").trim()
+  const fallbackDownloadDir = String(torrentstreamSettings?.downloadDir || "").trim()
+  const fallbackLibraryDir = String(settings?.library?.libraryPath || "").trim()
+  const destination = requestedDestination || fallbackDownloadDir || fallbackLibraryDir
+
+  if (!destination) {
+    throw new Error("destination not found")
+  }
+  if (!path.isAbsolute(destination)) {
+    throw new Error("destination path must be absolute")
+  }
+
+  const qbConfig = getQbittorrentConfigFromSettings(settings) || {}
+  const magnets = []
+  for (const torrent of torrents) {
+    const normalized = torrent && typeof torrent === "object" ? torrent : {}
+    const providerId = String(normalized.provider || "").trim()
+    if (!providerId) {
+      throw new Error("torrent provider is required")
+    }
+    const magnet = await getTorrentMagnetLink(config, providerId, normalized)
+    if (!magnet) {
+      throw new Error(`magnet link not found for provider=${providerId}`)
+    }
+    magnets.push(magnet)
+  }
+
+  await qb.addMagnets(magnets, destination, {
+    category: qbConfig.category || "",
+    tags: qbConfig.tags || "",
+    paused: false,
+  })
+
+  res.json(dataResponse(true))
+}))
+
+app.post("/api/v1/torrent-client/rule-magnet", wrapRoute(async (req, res) => {
+  const qb = getQbClient(db)
+  if (!qb) {
+    throw new Error("torrent client not configured")
+  }
+
+  const body = req.body && typeof req.body === "object" ? req.body : {}
+  const magnet = String(body.magnetUrl || body.magnetURL || "").trim()
+  if (!magnet) throw new Error("magnetUrl is required")
+
+  const torrentstreamSettings = getTorrentstreamSettings(config)
+  const settings = getSettings(db)
+  const destination = String(torrentstreamSettings?.downloadDir || "").trim() || String(settings?.library?.libraryPath || "").trim()
+  if (!destination) throw new Error("destination not found")
+
+  const qbConfig = getQbittorrentConfigFromSettings(settings) || {}
+  await qb.addMagnets([magnet], destination, {
+    category: qbConfig.category || "",
+    tags: qbConfig.tags || "",
+    paused: false,
+  })
+
+  res.json(dataResponse(true))
+}))
 
 app.get("/api/v1/anilist/collection", (_req, res) => {
-  res.json(dataResponse(buildAnimeCollection(getLocalAnimeEntries(db))))
+  res.json(dataResponse(buildAnimeCollection(filterAnimeOnlyRows(getLocalAnimeEntries(db)))))
 })
 
 app.post("/api/v1/anilist/collection", (_req, res) => {
-  res.json(dataResponse(buildAnimeCollection(getLocalAnimeEntries(db))))
+  res.json(dataResponse(buildAnimeCollection(filterAnimeOnlyRows(getLocalAnimeEntries(db)))))
 })
 
 app.get("/api/v1/anilist/collection/raw", (_req, res) => {
-  res.json(dataResponse(buildAnimeCollection(getLocalAnimeEntries(db))))
+  res.json(dataResponse(buildAnimeCollection(filterAnimeOnlyRows(getLocalAnimeEntries(db)))))
 })
 
 app.post("/api/v1/anilist/collection/raw", (_req, res) => {
-  res.json(dataResponse(buildAnimeCollection(getLocalAnimeEntries(db))))
+  res.json(dataResponse(buildAnimeCollection(filterAnimeOnlyRows(getLocalAnimeEntries(db)))))
 })
 
 app.get("/api/v1/library/collection", (req, res) => {
@@ -331,23 +775,228 @@ app.patch("/api/v1/continuity/item", wrapRoute((req, res) => {
 }))
 
 app.get("/api/v1/manga/anilist/collection", (_req, res) => {
-  res.json(dataResponse(emptyMangaAnilistCollection()))
+  res.json(dataResponse(buildMangaCollection(getLocalMangaEntries(db))))
+})
+
+app.post("/api/v1/manga/anilist/collection", (_req, res) => {
+  res.json(dataResponse(buildMangaCollection(getLocalMangaEntries(db))))
 })
 
 app.get("/api/v1/manga/anilist/collection/raw", (_req, res) => {
-  res.json(dataResponse(emptyMangaAnilistCollection()))
+  res.json(dataResponse(buildMangaCollection(getLocalMangaEntries(db))))
 })
 
 app.post("/api/v1/manga/anilist/collection/raw", (_req, res) => {
-  res.json(dataResponse(emptyMangaAnilistCollection()))
+  res.json(dataResponse(buildMangaCollection(getLocalMangaEntries(db))))
 })
 
 app.get("/api/v1/manga/collection", (_req, res) => {
-  res.json(dataResponse(emptyMangaCollection()))
+  res.json(dataResponse(buildLocalMangaCollection(getLocalMangaEntries(db))))
 })
 
 app.get("/api/v1/manga/latest-chapter-numbers", (_req, res) => {
   res.json(dataResponse({}))
+})
+
+app.post("/api/v1/manga/anilist/list", wrapRoute(async (req, res) => {
+  try {
+    const result = await listManga(req.body || {})
+    res.json(dataResponse(result))
+  } catch (error) {
+    logWarn("anilist", `listManga failed: ${error?.message || error}`)
+    res.json(dataResponse(emptyListedAnime()))
+  }
+}))
+
+app.post("/api/v1/manga/update-progress", wrapRoute(async (req, res) => {
+  const body = req.body && typeof req.body === "object" ? req.body : {}
+  const options = body?.options && typeof body.options === "object" ? body.options : body
+
+  const mediaId = Number(options.mediaId ?? options.mediaID ?? options.id ?? 0)
+  const chapterNumber = Number(options.chapterNumber ?? options.progress ?? 0)
+  const totalChapters = Number(options.totalChapters ?? options.chapters ?? 0)
+  if (!mediaId) throw new Error("mediaId is required")
+
+  const existing = getLocalMangaEntry(db, mediaId)
+  let media = null
+  if (existing?.media_json) {
+    try { media = JSON.parse(existing.media_json) } catch { media = null }
+  }
+  if (!media) {
+    try {
+      media = await getMangaDetails(mediaId)
+    } catch (error) {
+      logWarn("anilist", `getMangaDetails failed for manga/update-progress mediaId=${mediaId}: ${error?.message || error}`)
+      media = buildPlaceholderMangaMedia(mediaId)
+    }
+  }
+
+  const safeChapterNumber = Math.max(0, chapterNumber)
+  const safeTotal = Math.max(0, totalChapters || Number(media?.chapters || 0))
+  const status = safeTotal > 0 && safeChapterNumber >= safeTotal
+    ? "COMPLETED"
+    : (safeChapterNumber > 0 ? "CURRENT" : "PLANNING")
+
+  upsertLocalMangaEntry(db, {
+    media_id: mediaId,
+    media_json: JSON.stringify(media),
+    status,
+    progress: safeChapterNumber,
+    score: Number(existing?.score || 0),
+    repeat_count: Number(existing?.repeat_count || 0),
+    started_at: existing?.started_at || (safeChapterNumber > 0 ? new Date().toISOString() : null),
+    completed_at: status === "COMPLETED" ? (existing?.completed_at || new Date().toISOString()) : null,
+    created_at: existing?.created_at
+  })
+
+  notifySyncStateChanged("manga-list", { mediaId })
+  res.json(dataResponse(true))
+}))
+
+app.get("/api/v1/manga/entry/:id", wrapRoute(async (req, res) => {
+  const mediaId = Number(req.params.id)
+  if (!mediaId) {
+    throw new Error("mediaId is required")
+  }
+
+  let media = null
+  try {
+    media = await getMangaDetails(mediaId)
+  } catch (error) {
+    logWarn("anilist", `getMangaDetails failed for mediaId=${mediaId}: ${error?.message || error}`)
+    media = buildPlaceholderMangaMedia(mediaId)
+  }
+  res.json(dataResponse({
+    mediaId,
+    media,
+    listData: {
+      progress: 0,
+      score: 0,
+      status: null,
+      repeat: 0,
+      startedAt: "",
+      completedAt: "",
+    }
+  }))
+}))
+
+app.get("/api/v1/manga/entry/:id/details", wrapRoute(async (req, res) => {
+  const mediaId = Number(req.params.id)
+  if (!mediaId) {
+    throw new Error("mediaId is required")
+  }
+  try {
+    res.json(dataResponse(await getMangaDetails(mediaId)))
+  } catch (error) {
+    logWarn("anilist", `getMangaDetails failed for mediaId=${mediaId}: ${error?.message || error}`)
+    res.json(dataResponse(buildPlaceholderMangaMedia(mediaId)))
+  }
+}))
+
+app.post("/api/v1/manga/search", wrapRoute(async (req, res) => {
+  const provider = String(req.body?.provider || "").trim()
+  const query = String(req.body?.query || "").trim()
+  if (!provider) throw new Error("provider is required")
+  res.json(dataResponse(await searchManga(config, provider, query)))
+}))
+
+app.post("/api/v1/manga/manual-mapping", wrapRoute((req, res) => {
+  const provider = String(req.body?.provider || "").trim()
+  const mediaId = Number(req.body?.mediaId || 0)
+  const mangaId = String(req.body?.mangaId || "").trim()
+  upsertMangaMapping(db, provider, mediaId, mangaId)
+  res.json(dataResponse(true))
+}))
+
+app.post("/api/v1/manga/get-mapping", wrapRoute((req, res) => {
+  const provider = String(req.body?.provider || "").trim()
+  const mediaId = Number(req.body?.mediaId || 0)
+  const mapping = getMangaMapping(db, provider, mediaId)
+  res.json(dataResponse(mapping ? { mangaId: mapping } : {}))
+}))
+
+app.post("/api/v1/manga/remove-mapping", wrapRoute((req, res) => {
+  const provider = String(req.body?.provider || "").trim()
+  const mediaId = Number(req.body?.mediaId || 0)
+  deleteMangaMapping(db, provider, mediaId)
+  res.json(dataResponse(true))
+}))
+
+app.post("/api/v1/manga/chapters", wrapRoute(async (req, res) => {
+  const provider = String(req.body?.provider || "").trim()
+  const mediaId = Number(req.body?.mediaId || 0)
+  if (!provider) throw new Error("provider is required")
+  if (!mediaId) throw new Error("mediaId is required")
+
+  let mangaId = getMangaMapping(db, provider, mediaId)
+  if (!mangaId) {
+    const media = await getMangaDetails(mediaId).catch(() => null)
+    const candidateQueries = [
+      media?.title?.english,
+      media?.title?.romaji,
+      media?.title?.native,
+      media?.title?.userPreferred,
+    ].map((value) => String(value || "").trim()).filter(Boolean)
+
+    for (const query of candidateQueries) {
+      const results = await searchManga(config, provider, query).catch(() => [])
+      if (!results.length) continue
+      const best = pickBestMangaSearchResult(query, results)
+      if (!best?.id) continue
+      mangaId = best.id
+      upsertMangaMapping(db, provider, mediaId, mangaId)
+      break
+    }
+  }
+
+  if (!mangaId) {
+    res.json(dataResponse({ mediaId, provider, chapters: [] }))
+    return
+  }
+
+  const chapters = await findMangaChapters(config, provider, mangaId)
+  chapters.sort((a, b) => Number(a.index) - Number(b.index))
+  res.json(dataResponse({
+    mediaId,
+    provider,
+    chapters
+  }))
+}))
+
+app.post("/api/v1/manga/pages", wrapRoute(async (req, res) => {
+  const provider = String(req.body?.provider || "").trim()
+  const mediaId = Number(req.body?.mediaId || 0)
+  const chapterId = String(req.body?.chapterId || "").trim()
+  if (!provider) throw new Error("provider is required")
+  if (!mediaId) throw new Error("mediaId is required")
+  if (!chapterId) throw new Error("chapterId is required")
+
+  const pages = await findMangaChapterPages(config, provider, chapterId)
+  pages.sort((a, b) => Number(a.index) - Number(b.index))
+  res.json(dataResponse({
+    mediaId,
+    provider,
+    chapterId,
+    pages: pages.map((page) => ({
+      ...page,
+      headers: Object.fromEntries(Object.entries(page.headers || {}).map(([key, value]) => [String(key), String(value)]))
+    })),
+    pageDimensions: {},
+    isDownloaded: false
+  }))
+}))
+
+app.post("/api/v1/manga/download-data", wrapRoute((req, res) => {
+  const mediaId = Number(req.body?.mediaId || 0)
+  if (!mediaId) throw new Error("mediaId is required")
+  res.json(dataResponse({
+    downloaded: {},
+    queued: {}
+  }))
+}))
+
+app.get("/api/v1/manga/download-queue", (_req, res) => {
+  res.json(dataResponse([]))
 })
 
 app.post("/api/v1/extensions/all", (_req, res) => {
@@ -366,6 +1015,10 @@ app.post("/api/v1/anilist/list-recent-anime", wrapRoute(async (req, res) => {
 
 app.get("/api/v1/library/missing-episodes", (_req, res) => {
   res.json(dataResponse(buildMissingEpisodes(getLocalAnimeEntries(db))))
+})
+
+app.get("/api/v1/local/track/:id/:type", (_req, res) => {
+  res.json(dataResponse(false))
 })
 
 app.get("/api/v1/auto-downloader/items", (_req, res) => {
@@ -462,74 +1115,168 @@ app.get("/api/v1/anilist/stats", (_req, res) => {
 })
 
 app.get("/api/v1/anilist/media-details/:id", wrapRoute(async (req, res) => {
-  const media = await getAnimeDetails(req.params.id)
-  res.json(dataResponse(media))
+  try {
+    const media = await getAnimeDetails(req.params.id)
+    res.json(dataResponse(media))
+  } catch (error) {
+    logWarn("anilist", `media-details failed for id=${Number(req.params.id) || 0}: ${error?.message || error}`)
+    res.json(dataResponse(null))
+  }
 }))
 
 app.post("/api/v1/anilist/list-entry", wrapRoute(async (req, res) => {
-  const body = req.body || {}
-  const mediaId = Number(body.mediaId)
+  const body = req.body && typeof req.body === "object" ? req.body : {}
+  const options = body?.options && typeof body.options === "object" ? body.options : body
+  const mediaId = Number(
+    options.mediaId ??
+    options.mediaID ??
+    options.id ??
+    options?.media?.id ??
+    0
+  )
   if (!mediaId) {
     throw new Error("mediaId is required")
   }
 
-  const existing = getLocalAnimeEntry(db, mediaId)
-  const media = existing ? JSON.parse(existing.media_json) : await getAnimeDetails(mediaId)
+  const entryTypeRaw = String(options.type || options?.media?.type || "").trim().toLowerCase()
+  const entryType = entryTypeRaw === "manga" || entryTypeRaw === "anime" ? entryTypeRaw : ""
+  const existingAnime = getLocalAnimeEntry(db, mediaId)
+  const existingManga = getLocalMangaEntry(db, mediaId)
+
+  const shouldHandleManga = entryType === "manga" || (!entryType && Boolean(existingManga) && !existingAnime)
+  const shouldHandleAnime = entryType === "anime" || (!entryType && !shouldHandleManga)
+
+  let media = null
+  if (shouldHandleManga && existingManga?.media_json) {
+    try { media = JSON.parse(existingManga.media_json) } catch { media = null }
+  }
+  if (shouldHandleAnime && existingAnime?.media_json) {
+    try { media = JSON.parse(existingAnime.media_json) } catch { media = null }
+  }
+
+  if (!media) {
+    try {
+      media = shouldHandleManga ? await getMangaDetails(mediaId) : await getAnimeDetails(mediaId)
+    } catch (error) {
+      logWarn("anilist", `getMediaDetails failed for mediaId=${mediaId} type=${shouldHandleManga ? "manga" : "anime"}: ${error?.message || error}`)
+      media = shouldHandleManga ? buildPlaceholderMangaMedia(mediaId) : buildPlaceholderAnimeMedia(mediaId)
+    }
+  }
   if (!media) {
     throw new Error("anime not found")
   }
 
-  const hasProgress = Object.prototype.hasOwnProperty.call(body, "progress")
-  const hasStatus = Object.prototype.hasOwnProperty.call(body, "status")
-  const hasScore = Object.prototype.hasOwnProperty.call(body, "score")
-  const hasRepeat = Object.prototype.hasOwnProperty.call(body, "repeat")
-  const hasStartedAt = Object.prototype.hasOwnProperty.call(body, "startedAt")
-  const hasCompletedAt = Object.prototype.hasOwnProperty.call(body, "completedAt")
+  const mediaType = String(media?.type || "").trim().toUpperCase()
+  const isMangaMedia = mediaType === "MANGA"
+  const isAnimeMedia = mediaType === "ANIME"
+
+  const hasProgress = Object.prototype.hasOwnProperty.call(options, "progress")
+  const hasStatus = Object.prototype.hasOwnProperty.call(options, "status")
+  const hasScore = Object.prototype.hasOwnProperty.call(options, "score")
+  const hasRepeat = Object.prototype.hasOwnProperty.call(options, "repeat")
+  const hasStartedAt = Object.prototype.hasOwnProperty.call(options, "startedAt")
+  const hasCompletedAt = Object.prototype.hasOwnProperty.call(options, "completedAt")
 
   const progress = hasProgress
-    ? Number(body.progress ?? 0)
-    : Number(existing?.progress ?? 0)
-  const totalEpisodes = Number(media?.episodes || 0)
+    ? Number(options.progress ?? 0)
+    : Number((shouldHandleManga ? existingManga : existingAnime)?.progress ?? 0)
+
+  const inferredStatus = (() => {
+    if (shouldHandleManga) {
+      const totalChapters = Number(media?.chapters || 0)
+      if (totalChapters > 0 && progress >= totalChapters) return "COMPLETED"
+      if (progress > 0) return "CURRENT"
+      return "PLANNING"
+    }
+
+    const totalEpisodes = Number(media?.episodes || 0)
+    return inferStatus(progress, totalEpisodes, existingAnime?.status)
+  })()
+
   const status = hasStatus
-    ? String(body.status || inferStatus(progress, totalEpisodes, existing?.status))
-    : String(existing?.status || inferStatus(progress, totalEpisodes, existing?.status))
-  const score = hasScore ? Number(body.score ?? 0) : Number(existing?.score ?? 0)
-  const repeatCount = hasRepeat ? Number(body.repeat ?? 0) : Number(existing?.repeat_count ?? 0)
+    ? String(options.status || inferredStatus)
+    : String((shouldHandleManga ? existingManga : existingAnime)?.status || inferredStatus)
+  const score = hasScore ? Number(options.score ?? 0) : Number((shouldHandleManga ? existingManga : existingAnime)?.score ?? 0)
+  const repeatCount = hasRepeat ? Number(options.repeat ?? 0) : Number((shouldHandleManga ? existingManga : existingAnime)?.repeat_count ?? 0)
   const startedAt = hasStartedAt
-    ? (fuzzyDateToIso(body.startedAt) || null)
-    : (existing?.started_at || autoStartedAt(progress))
+    ? (fuzzyDateToIso(options.startedAt) || null)
+    : ((shouldHandleManga ? existingManga : existingAnime)?.started_at || autoStartedAt(progress))
   const completedAt = hasCompletedAt
-    ? (fuzzyDateToIso(body.completedAt) || null)
+    ? (fuzzyDateToIso(options.completedAt) || null)
     : (
       status === "COMPLETED"
-        ? (existing?.completed_at || autoCompletedAt(status))
-        : (hasStatus ? null : (existing?.completed_at || null))
+        ? ((shouldHandleManga ? existingManga : existingAnime)?.completed_at || autoCompletedAt(status))
+        : (hasStatus ? null : ((shouldHandleManga ? existingManga : existingAnime)?.completed_at || null))
     )
 
-  upsertLocalAnimeEntry(db, {
-    media_id: mediaId,
-    media_json: JSON.stringify(media),
-    status,
-    progress,
-    score,
-    repeat_count: repeatCount,
-    started_at: startedAt,
-    completed_at: completedAt,
-    created_at: existing?.created_at
-  })
+  if (shouldHandleManga || isMangaMedia) {
+    // Ensure manga entries never show up in the anime "My Lists".
+    if (existingAnime) {
+      deleteLocalAnimeEntry(db, mediaId)
+    }
+    upsertLocalMangaEntry(db, {
+      media_id: mediaId,
+      media_json: JSON.stringify(media),
+      status,
+      progress,
+      score,
+      repeat_count: repeatCount,
+      started_at: startedAt,
+      completed_at: completedAt,
+      created_at: existingManga?.created_at
+    })
+    logInfo("anilist", `saved local manga entry mediaId=${mediaId} status=${status} progress=${progress}`)
+    notifySyncStateChanged("manga-list", { mediaId })
+  } else if (shouldHandleAnime || isAnimeMedia) {
+    // Ensure anime entries never end up in the manga list.
+    if (existingManga) {
+      deleteLocalMangaEntry(db, mediaId)
+    }
+    upsertLocalAnimeEntry(db, {
+      media_id: mediaId,
+      media_json: JSON.stringify(media),
+      status,
+      progress,
+      score,
+      repeat_count: repeatCount,
+      started_at: startedAt,
+      completed_at: completedAt,
+      created_at: existingAnime?.created_at
+    })
+    logInfo("anilist", `saved local anime entry mediaId=${mediaId} status=${status} progress=${progress}`)
+    notifySyncStateChanged("anime-list", { mediaId })
+  } else {
+    // Unknown media types are ignored.
+    res.json(dataResponse(true))
+    return
+  }
 
-  notifySyncStateChanged("anime-list", { mediaId })
   res.json(dataResponse(true))
 }))
 
 app.delete("/api/v1/anilist/list-entry", wrapRoute((req, res) => {
-  const body = req.body || {}
-  const mediaId = Number(body.mediaId)
+  const body = req.body && typeof req.body === "object" ? req.body : {}
+  const options = body?.options && typeof body.options === "object" ? body.options : body
+  const mediaId = Number(
+    options.mediaId ??
+    options.mediaID ??
+    options.id ??
+    options?.media?.id ??
+    0
+  )
   if (!mediaId) {
     throw new Error("mediaId is required")
   }
 
-  deleteLocalAnimeEntry(db, mediaId)
+  const entryType = String(options.type || options?.media?.type || "").trim().toLowerCase()
+  if (entryType === "manga") {
+    deleteLocalMangaEntry(db, mediaId)
+  } else if (entryType === "anime") {
+    deleteLocalAnimeEntry(db, mediaId)
+  } else {
+    deleteLocalAnimeEntry(db, mediaId)
+    deleteLocalMangaEntry(db, mediaId)
+  }
   notifySyncStateChanged("anime-list", { mediaId })
   res.json(dataResponse(true))
 }))
@@ -539,7 +1286,13 @@ app.post("/api/v1/library/unknown-media", wrapRoute(async (req, res) => {
   for (const mediaId of mediaIds) {
     const existing = getLocalAnimeEntry(db, mediaId)
     if (existing) continue
-    const media = await getAnimeDetails(mediaId)
+    let media = null
+    try {
+      media = await getAnimeDetails(mediaId)
+    } catch (error) {
+      logWarn("anilist", `getAnimeDetails failed for unknown-media mediaId=${mediaId}: ${error?.message || error}`)
+      media = buildPlaceholderAnimeMedia(mediaId)
+    }
     if (!media) continue
     upsertLocalAnimeEntry(db, {
       media_id: mediaId,
@@ -577,7 +1330,14 @@ app.get("/api/v1/library/anime-entry/:id", wrapRoute(async (req, res) => {
     return
   }
 
-  const media = await getAnimeDetails(req.params.id)
+  let media = null
+  try {
+    media = await getAnimeDetails(req.params.id)
+  } catch (error) {
+    logWarn("anilist", `getAnimeDetails failed for library/anime-entry id=${Number(req.params.id) || 0}: ${error?.message || error}`)
+    media = buildPlaceholderAnimeMedia(Number(req.params.id) || 0)
+  }
+
   res.json(dataResponse(media ? buildRemoteAnimeEntry(media, { continuity }) : null))
 }))
 
@@ -593,8 +1353,9 @@ app.get("/api/v1/anime/episode-collection/:id", wrapRoute(async (req, res) => {
 }))
 
 app.post("/api/v1/library/anime-entry/update-progress", wrapRoute(async (req, res) => {
-  const body = req.body || {}
-  const mediaId = Number(body.mediaId)
+  const body = req.body && typeof req.body === "object" ? req.body : {}
+  const options = body?.options && typeof body.options === "object" ? body.options : body
+  const mediaId = Number(options.mediaId ?? options.mediaID ?? options.id ?? 0)
   if (!mediaId) {
     throw new Error("mediaId is required")
   }
@@ -605,8 +1366,8 @@ app.post("/api/v1/library/anime-entry/update-progress", wrapRoute(async (req, re
     throw new Error("anime not found")
   }
 
-  const progress = Number(body.episodeNumber || 0)
-  const totalEpisodes = Number(body.totalEpisodes || media?.episodes || 0)
+  const progress = Number(options.episodeNumber || 0)
+  const totalEpisodes = Number(options.totalEpisodes || media?.episodes || 0)
   const status = inferStatus(progress, totalEpisodes, row?.status)
 
   upsertLocalAnimeEntry(db, {
@@ -634,8 +1395,9 @@ app.post("/api/v1/library/anime-entry/update-progress", wrapRoute(async (req, re
 }))
 
 app.post("/api/v1/library/anime-entry/update-repeat", wrapRoute((req, res) => {
-  const body = req.body || {}
-  const mediaId = Number(body.mediaId)
+  const body = req.body && typeof req.body === "object" ? req.body : {}
+  const options = body?.options && typeof body.options === "object" ? body.options : body
+  const mediaId = Number(options.mediaId ?? options.mediaID ?? options.id ?? 0)
   const row = getLocalAnimeEntry(db, mediaId)
   if (!row) {
     throw new Error("anime entry not found")
@@ -645,7 +1407,7 @@ app.post("/api/v1/library/anime-entry/update-repeat", wrapRoute((req, res) => {
     ...row,
     media_id: row.media_id,
     media_json: row.media_json,
-    repeat_count: Number(body.repeat || 0)
+    repeat_count: Number(options.repeat || 0)
   })
 
   notifySyncStateChanged("anime-list", { mediaId })
@@ -653,21 +1415,28 @@ app.post("/api/v1/library/anime-entry/update-repeat", wrapRoute((req, res) => {
 }))
 
 app.post("/api/v1/onlinestream/episode-list", wrapRoute(async (req, res) => {
-  const mediaId = Number(req.body?.mediaId)
-  const provider = String(req.body?.provider || "").trim()
-  const dubbed = parseBoolean(req.body?.dubbed)
+  const body = req.body && typeof req.body === "object" ? req.body : {}
+  const mediaId = Number(body.mediaId ?? body.mediaID ?? body.id ?? 0)
+  const provider = String(body.provider || "").trim()
+  const dubbed = parseBoolean(body.dubbed)
   if (!mediaId) {
     throw new Error("mediaId is required")
   }
 
-  res.json(dataResponse(await getOnlineStreamEpisodeList(config, mediaId, provider, dubbed)))
+  try {
+    res.json(dataResponse(await getOnlineStreamEpisodeList(config, mediaId, provider, dubbed)))
+  } catch (error) {
+    logWarn("onlinestream", `episode-list failed mediaId=${mediaId} provider=${provider || "none"}: ${error?.message || error}`)
+    res.json(dataResponse({ media: buildPlaceholderAnimeMedia(mediaId), episodes: [] }))
+  }
 }))
 
 app.post("/api/v1/onlinestream/episode-source", wrapRoute(async (req, res) => {
-  const mediaId = Number(req.body?.mediaId)
-  const provider = String(req.body?.provider || "").trim()
-  const dubbed = parseBoolean(req.body?.dubbed)
-  const episodeNumber = Number(req.body?.episodeNumber)
+  const body = req.body && typeof req.body === "object" ? req.body : {}
+  const mediaId = Number(body.mediaId ?? body.mediaID ?? body.id ?? 0)
+  const provider = String(body.provider || "").trim()
+  const dubbed = parseBoolean(body.dubbed)
+  const episodeNumber = Number(body.episodeNumber)
   if (!mediaId) {
     throw new Error("mediaId is required")
   }
@@ -678,7 +1447,12 @@ app.post("/api/v1/onlinestream/episode-source", wrapRoute(async (req, res) => {
     throw new Error("episodeNumber is required")
   }
 
-  res.json(dataResponse(await getOnlineStreamEpisodeSource(config, mediaId, provider, episodeNumber, dubbed)))
+  try {
+    res.json(dataResponse(await getOnlineStreamEpisodeSource(config, mediaId, provider, episodeNumber, dubbed)))
+  } catch (error) {
+    logWarn("onlinestream", `episode-source failed mediaId=${mediaId} provider=${provider}: ${error?.message || error}`)
+    res.json(dataResponse({ number: episodeNumber, videoSources: [] }))
+  }
 }))
 
 app.head("/api/v1/proxy", wrapRoute(async (req, res) => {
@@ -860,7 +1634,19 @@ app.post("/api/v1/auth/update", wrapRoute(async (req, res) => {
   res.json(dataResponse(getStatus({ db, config, req })))
 }))
 
+const generatedStubResult = registerGeneratedApiStubs(app, {
+  enabled: true,
+  log: (message) => logWarn("stubs", message),
+})
+if (generatedStubResult.registered) {
+  logInfo("stubs", `registered ${generatedStubResult.registered} generated API stubs`)
+}
+
 app.use("/api/v1", (req, res) => {
+  if (req.method === "HEAD") {
+    res.status(200).end()
+    return
+  }
   logWarn("stub", `${req.method} ${req.originalUrl}`)
   res.json(dataResponse(getStubPayload(req)))
 })
@@ -951,7 +1737,7 @@ function buildDesktopSyncExport({ db, config, req }) {
     status: getStatus({ db, config, req }),
     settings: getSettings(db),
     theme: getTheme(db),
-    collection: buildAnimeCollection(getLocalAnimeEntries(db)),
+    collection: buildAnimeCollection(filterAnimeOnlyRows(getLocalAnimeEntries(db))),
     continuity: getContinuityWatchHistory(db, getContinuityUserKey(req)),
   }
 }
@@ -1128,6 +1914,9 @@ function getStubPayload(req) {
   const { method, path: requestPath } = req
 
   if (method === "GET") {
+    if (requestPath.includes("/logs/latest") || requestPath.includes("/log/")) {
+      return ""
+    }
     if (
       requestPath.includes("/list") ||
       requestPath.includes("/logs/filenames") ||
@@ -1157,6 +1946,198 @@ function getStubPayload(req) {
   }
 
   return null
+}
+
+function safeDecodeURIComponent(value) {
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return String(value || "")
+  }
+}
+
+async function getDirectorySizeBytes(targetDir) {
+  try {
+    const stat = await fs.promises.stat(targetDir)
+    if (!stat.isDirectory()) return 0
+  } catch {
+    return 0
+  }
+
+  let total = 0
+  const entries = await fs.promises.readdir(targetDir, { withFileTypes: true })
+  for (const entry of entries) {
+    const fullPath = path.join(targetDir, entry.name)
+    if (entry.isDirectory()) {
+      total += await getDirectorySizeBytes(fullPath)
+      continue
+    }
+    if (entry.isFile()) {
+      try {
+        const s = await fs.promises.stat(fullPath)
+        total += s.size
+      } catch {
+      }
+    }
+  }
+  return total
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes || 0)
+  if (!Number.isFinite(value) || value <= 0) return "0 B"
+  const units = ["B", "KB", "MB", "GB", "TB"]
+  let unitIndex = 0
+  let current = value
+  while (current >= 1024 && unitIndex < units.length - 1) {
+    current /= 1024
+    unitIndex += 1
+  }
+  const rounded = current >= 10 || unitIndex === 0 ? Math.round(current) : Math.round(current * 10) / 10
+  return `${rounded} ${units[unitIndex]}`
+}
+
+function buildPlaceholderAnimeMedia(mediaId) {
+  const id = Number(mediaId || 0)
+  return {
+    id,
+    idMal: 0,
+    siteUrl: "",
+    status: "UNKNOWN",
+    season: null,
+    type: "ANIME",
+    format: null,
+    seasonYear: null,
+    bannerImage: "",
+    episodes: 0,
+    synonyms: [],
+    isAdult: false,
+    countryOfOrigin: "",
+    meanScore: 0,
+    description: "",
+    genres: [],
+    duration: 0,
+    trailer: null,
+    title: {
+      english: "",
+      native: "",
+      romaji: "",
+      userPreferred: `Media ${id}`
+    },
+    coverImage: {
+      color: "",
+      extraLarge: "",
+      large: "",
+      medium: ""
+    },
+    startDate: { day: 0, month: 0, year: 0 },
+    endDate: { day: 0, month: 0, year: 0 },
+    nextAiringEpisode: null,
+    streamingEpisodes: []
+  }
+}
+
+function buildPlaceholderMangaMedia(mediaId) {
+  const id = Number(mediaId || 0)
+  return {
+    id,
+    idMal: 0,
+    siteUrl: "",
+    status: "UNKNOWN",
+    type: "MANGA",
+    format: null,
+    chapters: 0,
+    volumes: 0,
+    synonyms: [],
+    isAdult: false,
+    countryOfOrigin: "",
+    meanScore: 0,
+    description: "",
+    genres: [],
+    title: {
+      english: "",
+      native: "",
+      romaji: "",
+      userPreferred: `Media ${id}`
+    },
+    coverImage: {
+      color: "",
+      extraLarge: "",
+      large: "",
+      medium: ""
+    },
+    startDate: { day: 0, month: 0, year: 0 },
+    endDate: { day: 0, month: 0, year: 0 },
+  }
+}
+
+function pickBestMangaSearchResult(query, results) {
+  if (!Array.isArray(results) || !results.length) return null
+  const normalizedQuery = normalizeText(query)
+  let best = results[0]
+  let bestScore = -1
+
+  for (const item of results) {
+    const title = String(item?.title || "")
+    const synonyms = Array.isArray(item?.synonyms) ? item.synonyms : []
+    const rating = typeof item?.searchRating === "number" ? item.searchRating : 0
+
+    const candidateTexts = [title, ...synonyms].map(normalizeText).filter(Boolean)
+    let textScore = 0
+    for (const candidate of candidateTexts) {
+      if (candidate === normalizedQuery) {
+        textScore = Math.max(textScore, 5)
+      } else if (candidate.includes(normalizedQuery) || normalizedQuery.includes(candidate)) {
+        textScore = Math.max(textScore, 3)
+      }
+    }
+
+    const score = (rating * 10) + textScore
+    if (score > bestScore) {
+      best = item
+      bestScore = score
+    }
+  }
+
+  return best
+}
+
+function normalizeText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+}
+
+function filterAnimeOnlyRows(rows) {
+  const list = Array.isArray(rows) ? rows : []
+  return list.filter((row) => {
+    try {
+      const media = typeof row?.media_json === "string" ? JSON.parse(row.media_json) : row?.media_json
+      const type = String(media?.type || "").trim().toUpperCase()
+      return !type || type === "ANIME"
+    } catch {
+      return true
+    }
+  })
+}
+
+function getQbClient(dbRef) {
+  const settings = getSettings(dbRef)
+  const qbConfig = getQbittorrentConfigFromSettings(settings)
+  if (!qbConfig) return null
+
+  const key = `${qbConfig.host}:${qbConfig.port}:${qbConfig.username}:${qbConfig.password}`
+  if (qbClientCache.key === key && qbClientCache.client) {
+    return qbClientCache.client
+  }
+
+  qbClientCache = { key, client: new QbittorrentClient(qbConfig) }
+  return qbClientCache.client
+}
+
+function waitMs(durationMs) {
+  return new Promise((resolve) => setTimeout(resolve, durationMs))
 }
 
 function wrapRoute(handler) {

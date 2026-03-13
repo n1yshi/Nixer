@@ -54,6 +54,19 @@ export function createDb(config) {
       updated_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS local_manga_entries (
+      media_id INTEGER PRIMARY KEY,
+      media_json TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'PLANNING',
+      progress INTEGER NOT NULL DEFAULT 0,
+      score INTEGER NOT NULL DEFAULT 0,
+      repeat_count INTEGER NOT NULL DEFAULT 0,
+      started_at TEXT,
+      completed_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS continuity_watch_history (
       user_key TEXT NOT NULL,
       media_id INTEGER NOT NULL,
@@ -65,6 +78,15 @@ export function createDb(config) {
       time_added TEXT NOT NULL,
       time_updated TEXT NOT NULL,
       PRIMARY KEY (user_key, media_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS manga_mappings (
+      provider TEXT NOT NULL,
+      media_id INTEGER NOT NULL,
+      manga_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (provider, media_id)
     );
   `)
 
@@ -243,6 +265,81 @@ export function deleteLocalAnimeEntry(db, mediaId) {
   return db.prepare("DELETE FROM local_anime_entries WHERE media_id = ?").run(mediaId)
 }
 
+export function getLocalMangaEntries(db) {
+  return db.prepare(`
+    SELECT
+      media_id,
+      media_json,
+      status,
+      progress,
+      score,
+      repeat_count,
+      started_at,
+      completed_at,
+      created_at,
+      updated_at
+    FROM local_manga_entries
+    ORDER BY updated_at DESC
+  `).all()
+}
+
+export function getLocalMangaEntry(db, mediaId) {
+  return db.prepare(`
+    SELECT
+      media_id,
+      media_json,
+      status,
+      progress,
+      score,
+      repeat_count,
+      started_at,
+      completed_at,
+      created_at,
+      updated_at
+    FROM local_manga_entries
+    WHERE media_id = ?
+  `).get(mediaId) || null
+}
+
+export function upsertLocalMangaEntry(db, entry) {
+  const now = new Date().toISOString()
+  const payload = {
+    media_id: entry.media_id,
+    media_json: entry.media_json,
+    status: entry.status || "PLANNING",
+    progress: entry.progress || 0,
+    score: entry.score || 0,
+    repeat_count: entry.repeat_count || 0,
+    started_at: entry.started_at || null,
+    completed_at: entry.completed_at || null,
+    created_at: entry.created_at || now,
+    updated_at: now,
+  }
+
+  db.prepare(`
+    INSERT INTO local_manga_entries (
+      media_id, media_json, status, progress, score, repeat_count, started_at, completed_at, created_at, updated_at
+    ) VALUES (
+      @media_id, @media_json, @status, @progress, @score, @repeat_count, @started_at, @completed_at, @created_at, @updated_at
+    )
+    ON CONFLICT(media_id) DO UPDATE SET
+      media_json = excluded.media_json,
+      status = excluded.status,
+      progress = excluded.progress,
+      score = excluded.score,
+      repeat_count = excluded.repeat_count,
+      started_at = excluded.started_at,
+      completed_at = excluded.completed_at,
+      updated_at = excluded.updated_at
+  `).run(payload)
+
+  return getLocalMangaEntry(db, payload.media_id)
+}
+
+export function deleteLocalMangaEntry(db, mediaId) {
+  return db.prepare("DELETE FROM local_manga_entries WHERE media_id = ?").run(mediaId)
+}
+
 export function getContinuityWatchHistory(db, userKey = "global") {
   const rows = db.prepare(`
     SELECT
@@ -348,6 +445,38 @@ export function upsertContinuityWatchHistoryItem(db, item) {
     item: getContinuityWatchHistoryItem(db, userKey, payload.media_id),
     ignoredRegression: false,
   }
+}
+
+export function getMangaMapping(db, provider, mediaId) {
+  const row = db.prepare("SELECT manga_id FROM manga_mappings WHERE provider = ? AND media_id = ?")
+    .get(String(provider || ""), Number(mediaId || 0))
+  return row?.manga_id ? String(row.manga_id) : null
+}
+
+export function upsertMangaMapping(db, provider, mediaId, mangaId) {
+  const now = new Date().toISOString()
+  const safeProvider = String(provider || "")
+  const safeMediaId = Number(mediaId || 0)
+  const safeMangaId = String(mangaId || "")
+  if (!safeProvider) throw new Error("provider is required")
+  if (!safeMediaId) throw new Error("mediaId is required")
+  if (!safeMangaId) throw new Error("mangaId is required")
+
+  const existing = db.prepare("SELECT provider FROM manga_mappings WHERE provider = ? AND media_id = ?").get(safeProvider, safeMediaId)
+  if (existing) {
+    db.prepare("UPDATE manga_mappings SET manga_id = ?, updated_at = ? WHERE provider = ? AND media_id = ?")
+      .run(safeMangaId, now, safeProvider, safeMediaId)
+    return true
+  }
+
+  db.prepare("INSERT INTO manga_mappings (provider, media_id, manga_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)")
+    .run(safeProvider, safeMediaId, safeMangaId, now, now)
+  return true
+}
+
+export function deleteMangaMapping(db, provider, mediaId) {
+  db.prepare("DELETE FROM manga_mappings WHERE provider = ? AND media_id = ?").run(String(provider || ""), Number(mediaId || 0))
+  return true
 }
 
 function shouldIgnoreContinuityRegression(existing, nextPayload) {

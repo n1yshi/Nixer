@@ -2,6 +2,7 @@ import os from "node:os"
 
 import { defaultFeatureFlags } from "./defaults.mjs"
 import { getAccount, getSettings, getTheme } from "./db.mjs"
+import { getDebridSettings, getMediastreamSettings, getTorrentstreamSettings } from "./secondary-settings.mjs"
 import { newSimulatedUser } from "./user.mjs"
 
 export function getStatus({ db, config, req }) {
@@ -27,18 +28,9 @@ export function getStatus({ db, config, req }) {
     versionName: config.versionName,
     themeSettings: theme,
     isOffline: false,
-    mediastreamSettings: {
-      enabled: false,
-      transcodeEnabled: false
-    },
-    torrentstreamSettings: {
-      enabled: false,
-      includeInLibrary: false
-    },
-    debridSettings: {
-      enabled: false,
-      provider: "none"
-    },
+    mediastreamSettings: getMediastreamSettings(config),
+    torrentstreamSettings: getTorrentstreamSettings(config),
+    debridSettings: getDebridSettings(config),
     anilistClientId: "",
     updating: false,
     isDesktopSidecar: false,

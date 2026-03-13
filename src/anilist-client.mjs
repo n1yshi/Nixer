@@ -7,7 +7,9 @@ const pendingRequests = new Map()
 const TTL = {
   listAnime: 5 * 60 * 1000,
   listRecentAnime: 2 * 60 * 1000,
-  animeDetails: 12 * 60 * 60 * 1000
+  animeDetails: 12 * 60 * 60 * 1000,
+  listManga: 5 * 60 * 1000,
+  mangaDetails: 12 * 60 * 60 * 1000
 }
 
 const BASE_ANIME_FIELDS = `
@@ -59,6 +61,45 @@ const BASE_ANIME_FIELDS = `
     airingAt
     episode
     timeUntilAiring
+  }
+`
+
+const BASE_MANGA_FIELDS = `
+  id
+  idMal
+  siteUrl
+  status
+  type
+  format
+  chapters
+  volumes
+  synonyms
+  isAdult
+  countryOfOrigin
+  meanScore
+  description(asHtml: false)
+  genres
+  title {
+    english
+    native
+    romaji
+    userPreferred
+  }
+  coverImage {
+    color
+    extraLarge
+    large
+    medium
+  }
+  startDate {
+    day
+    month
+    year
+  }
+  endDate {
+    day
+    month
+    year
   }
 `
 
@@ -115,6 +156,59 @@ export async function listAnime(variables) {
   return data
 }
 
+export async function listManga(variables) {
+  const normalizedVariables = normalizeListAnimeVariables(variables)
+  const query = `
+    query ListManga(
+      $page: Int,
+      $perPage: Int,
+      $search: String,
+      $sort: [MediaSort],
+      $status: [MediaStatus],
+      $genres: [String],
+      $averageScore_greater: Int,
+      $season: MediaSeason,
+      $seasonYear: Int,
+      $format: MediaFormat,
+      $isAdult: Boolean,
+      $countryOfOrigin: CountryCode
+    ) {
+      Page(page: $page, perPage: $perPage) {
+        pageInfo {
+          currentPage
+          hasNextPage
+          lastPage
+          perPage
+          total
+        }
+        media(
+          type: MANGA
+          search: $search
+          sort: $sort
+          status_in: $status
+          genre_in: $genres
+          averageScore_greater: $averageScore_greater
+          season: $season
+          seasonYear: $seasonYear
+          format: $format
+          isAdult: $isAdult
+          countryOfOrigin: $countryOfOrigin
+        ) {
+          ${BASE_MANGA_FIELDS}
+        }
+      }
+    }
+  `
+
+  const data = await sendAniListCachedQuery({
+    cacheKey: `listManga:${stableStringify(normalizedVariables)}`,
+    ttlMs: TTL.listManga,
+    query,
+    variables: normalizedVariables
+  })
+  return data
+}
+
 export async function getAnimeDetails(mediaId) {
   const variables = { id: Number(mediaId) }
   try {
@@ -146,6 +240,26 @@ export async function getAnimeDetails(mediaId) {
       }
       : null
   }
+}
+
+export async function getMangaDetails(mediaId) {
+  const variables = { id: Number(mediaId) }
+  const query = `
+    query MangaDetails($id: Int) {
+      Media(id: $id, type: MANGA) {
+        ${BASE_MANGA_FIELDS}
+      }
+    }
+  `
+
+  const data = await sendAniListCachedQuery({
+    cacheKey: `mangaDetails:${variables.id}`,
+    ttlMs: TTL.mangaDetails,
+    query,
+    variables
+  })
+
+  return data?.Media || null
 }
 
 export async function listRecentAnime(variables) {
@@ -245,15 +359,27 @@ async function sendAniListQuery(query, variables) {
     body: JSON.stringify({ query, variables })
   })
 
-  const json = await response.json()
+  const rawText = await response.text()
+  let json = null
+  try {
+    json = rawText ? JSON.parse(rawText) : null
+  } catch {
+    json = null
+  }
 
   if (!response.ok || json?.errors?.length) {
-    const error = new Error(json?.errors?.[0]?.message || `AniList request failed with ${response.status}`)
+    const message = json?.errors?.[0]?.message
+      ? String(json.errors[0].message)
+      : `AniList request failed with ${response.status}`
+    const error = new Error(message)
     error.statusCode = response.status
+    if (!json && rawText) {
+      error.detail = rawText.slice(0, 400)
+    }
     throw error
   }
 
-  return json.data
+  return json?.data
 }
 
 function buildMediaDetailsQuery({ includeStreamingEpisodes }) {
@@ -299,7 +425,7 @@ function normalizeListAnimeVariables(variables = {}) {
     genres: Array.isArray(variables.genres) && variables.genres.length > 0 ? variables.genres : undefined,
     averageScore_greater: variables.averageScore_greater || undefined,
     season: variables.season || undefined,
-    seasonYear: variables.seasonYear || undefined,
+    seasonYear: variables.seasonYear || variables.year || undefined,
     format: variables.format || undefined,
     isAdult: Boolean(variables.isAdult),
     countryOfOrigin: variables.countryOfOrigin || undefined

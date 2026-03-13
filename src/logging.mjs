@@ -1,5 +1,7 @@
 import { inspect } from "node:util"
 
+import { appendLogLine } from "./logs-store.mjs"
+
 const COLOR_RESET = "\x1b[0m"
 const COLOR_BOLD = 1
 const COLOR_RED = 31
@@ -39,13 +41,16 @@ export function logError(scope, message, detail) {
 
 function writeLog(level, scope, message, detail) {
   const method = level === "error" ? "error" : "log"
-  console[method](formatLogLine(level, scope, message))
+  const headline = formatLogLine(level, scope, message)
+  console[method](headline)
+  appendLogLine(stripAnsi(headline))
 
   const formattedDetail = formatDetail(detail)
   if (!formattedDetail) return
 
   for (const line of formattedDetail.split("\n")) {
     console[method](colorize(line, COLOR_DARK_GRAY))
+    appendLogLine(stripAnsi(line))
   }
 }
 
@@ -91,4 +96,8 @@ function colorize(value, ...codes) {
   const text = String(value)
   if (!USE_COLOR || !codes.length) return text
   return `\x1b[${codes.join(";")}m${text}${COLOR_RESET}`
+}
+
+function stripAnsi(value) {
+  return String(value || "").replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "")
 }
