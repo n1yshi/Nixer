@@ -6,7 +6,6 @@ export function attachWebsocket(server, config) {
 
   server.on("upgrade", (req, socket, head) => {
     if (!req.url?.startsWith("/events")) {
-      socket.destroy()
       return
     }
 

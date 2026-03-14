@@ -1,8 +1,11 @@
 import fs from "node:fs"
 import path from "node:path"
 
+import { inferDefaultValueFromApiSpec } from "./api-type-defaults.mjs"
+
 export function registerGeneratedApiStubs(app, {
   specPath = path.resolve(process.cwd(), "example", "codegen", "generated", "handlers.json"),
+  structsPath = path.resolve(process.cwd(), "example", "codegen", "generated", "public_structs.json"),
   enabled = true,
   log = () => {},
   allowOverrideExisting = false,
@@ -23,14 +26,15 @@ export function registerGeneratedApiStubs(app, {
   let registered = 0
 
   for (const entry of entries) {
-    const endpoint = entry?.api?.endpoint
+    const rawEndpoint = entry?.api?.endpoint
     const methods = entry?.api?.methods
-    if (typeof endpoint !== "string" || !endpoint.startsWith("/api/")) continue
+    if (typeof rawEndpoint !== "string" || !rawEndpoint.startsWith("/api/")) continue
     if (!Array.isArray(methods) || !methods.length) continue
+    const endpoint = normalizeEndpointForExpress(rawEndpoint)
 
     for (const method of methods) {
       const lower = String(method || "").toLowerCase()
-      const handler = buildStubHandler(entry)
+      const handler = buildStubHandler(entry, { structsPath, log })
 
       if (lower === "head") {
         app.head(endpoint, (_req, res) => {
@@ -54,12 +58,23 @@ export function registerGeneratedApiStubs(app, {
   return { registered, specPath }
 }
 
-function buildStubHandler(entry) {
+function buildStubHandler(entry, { structsPath, log }) {
   const returnSpec = String(entry?.api?.returns || "")
   const tsType = String(entry?.api?.returnTypescriptType || "")
   const goType = String(entry?.api?.returnGoType || "")
 
-  const defaultValue = inferDefaultValue({ returnSpec, tsType, goType })
+  const normalizedReturns = returnSpec.trim()
+  const normalizedTs = tsType.trim()
+  const normalizedGo = goType.trim()
+  const isBooleanReturn = normalizedReturns === "bool" || normalizedGo === "bool" || normalizedTs === "boolean"
+
+  const baseDefaultValue = inferDefaultValueFromApiSpec({
+    returnSpec,
+    tsType,
+    goType,
+    structsPath,
+    log,
+  })
 
   return (req, res) => {
     if (req.method === "HEAD") {
@@ -67,27 +82,15 @@ function buildStubHandler(entry) {
       return
     }
 
-    res.json({ data: defaultValue })
+    let value = baseDefaultValue && typeof baseDefaultValue === "object"
+      ? structuredClone(baseDefaultValue)
+      : baseDefaultValue
+
+    if (isBooleanReturn && req.method !== "GET") {
+      value = true
+    }
+    res.json({ data: value })
   }
-}
-
-function inferDefaultValue({ returnSpec, tsType, goType }) {
-  const normalizedReturns = String(returnSpec || "").trim()
-  const normalizedTs = String(tsType || "").trim()
-  const normalizedGo = String(goType || "").trim()
-
-  if (normalizedReturns === "true") return true
-  if (normalizedGo === "bool" || normalizedReturns === "bool") return true
-
-  if (normalizedReturns.startsWith("[]")) return []
-  if (normalizedTs.startsWith("Array<")) return []
-  if (normalizedTs.endsWith("[]")) return []
-
-  if (normalizedTs.startsWith("Record<")) return {}
-
-  if (normalizedGo === "string" || normalizedReturns === "string") return ""
-
-  return {}
 }
 
 function hasExistingRoute(app, method, endpoint) {
@@ -102,4 +105,8 @@ function hasExistingRoute(app, method, endpoint) {
   }
 
   return false
+}
+
+function normalizeEndpointForExpress(endpoint) {
+  return String(endpoint || "").replace(/\{([^}]+)\}/g, (_match, name) => `:${String(name || "").trim()}`)
 }

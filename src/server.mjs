@@ -20,9 +20,11 @@ import {
   deleteMangaMapping,
   deleteLocalAnimeEntry,
   deleteLocalMangaEntry,
+  deleteLocalFilesNotIn,
   getAccount,
   getLocalAnimeEntries,
   getLocalAnimeEntry,
+  getLocalFiles,
   getLocalMangaEntries,
   getLocalMangaEntry,
   getMangaMapping,
@@ -34,11 +36,14 @@ import {
   upsertContinuityWatchHistoryItem,
   upsertMangaMapping,
   upsertLocalAnimeEntry,
-  upsertLocalMangaEntry
+  upsertLocalMangaEntry,
+  upsertLocalFile,
+  updateLocalFile
 } from "./db.mjs"
 import { buildAnimeCollection, buildAnimeEntry, buildLibraryCollection, buildLocalStats, buildRemoteAnimeEntry } from "./local-anime.mjs"
 import { buildLocalMangaCollection, buildMangaCollection } from "./local-manga.mjs"
 import { defaultHomeItems } from "./defaults.mjs"
+import { buildLibraryExplorerFileTree, directorySelector, resolveLibraryRoots, scanVideoFiles } from "./library-explorer.mjs"
 import {
   fetchExternalExtensionData,
   getAllExtensions,
@@ -347,6 +352,25 @@ app.post("/api/v1/announcements", (_req, res) => {
   res.json(dataResponse([]))
 })
 
+app.post("/api/v1/directory-selector", wrapRoute(async (req, res) => {
+  const input = String(req.body?.input || "").trim()
+  res.json(dataResponse(await directorySelector(input)))
+}))
+
+app.post("/api/v1/open-in-explorer", wrapRoute(async (req, res) => {
+  if (String(process.env.NIXER_ENABLE_OPEN_IN_EXPLORER || "") !== "1") {
+    res.json(dataResponse(false))
+    return
+  }
+
+  const target = String(req.body?.path || "").trim()
+  if (!target) throw new Error("path is required")
+  if (!path.isAbsolute(target)) throw new Error("path must be absolute")
+
+  const ok = await tryOpenInExplorer(execFileAsync, target)
+  res.json(dataResponse(ok))
+}))
+
 app.get("/api/v1/logs/filenames", (_req, res) => {
   res.json(dataResponse(getLogFilenames()))
 })
@@ -526,7 +550,8 @@ app.get("/api/v1/torrent-client/list", wrapRoute(async (req, res) => {
 app.post("/api/v1/torrent-client/action", wrapRoute(async (req, res) => {
   const qb = getQbClient(db)
   if (!qb) {
-    throw new Error("torrent client not configured")
+    res.json(dataResponse(false))
+    return
   }
 
   const body = req.body && typeof req.body === "object" ? req.body : {}
@@ -558,7 +583,8 @@ app.post("/api/v1/torrent-client/action", wrapRoute(async (req, res) => {
 app.post("/api/v1/torrent-client/get-files", wrapRoute(async (req, res) => {
   const qb = getQbClient(db)
   if (!qb) {
-    throw new Error("torrent client not configured")
+    res.json(dataResponse([]))
+    return
   }
 
   const body = req.body && typeof req.body === "object" ? req.body : {}
@@ -613,7 +639,8 @@ app.post("/api/v1/torrent-client/get-files", wrapRoute(async (req, res) => {
 app.post("/api/v1/torrent-client/download", wrapRoute(async (req, res) => {
   const qb = getQbClient(db)
   if (!qb) {
-    throw new Error("torrent client not configured")
+    res.json(dataResponse(false))
+    return
   }
 
   const body = req.body && typeof req.body === "object" ? req.body : {}
@@ -660,7 +687,8 @@ app.post("/api/v1/torrent-client/download", wrapRoute(async (req, res) => {
 app.post("/api/v1/torrent-client/rule-magnet", wrapRoute(async (req, res) => {
   const qb = getQbClient(db)
   if (!qb) {
-    throw new Error("torrent client not configured")
+    res.json(dataResponse(false))
+    return
   }
 
   const body = req.body && typeof req.body === "object" ? req.body : {}
@@ -711,6 +739,114 @@ app.post("/api/v1/library/collection", (req, res) => {
     continuityByMediaId: getContinuityWatchHistory(db, userKey),
   })))
 })
+
+app.get("/api/v1/library/explorer/file-tree", wrapRoute(async (_req, res) => {
+  const settings = getSettings(db)
+  const roots = resolveLibraryRoots(settings)
+  const localFiles = getLocalFiles(db)
+  res.json(dataResponse(buildLibraryExplorerFileTree(roots, localFiles)))
+}))
+
+app.post("/api/v1/library/explorer/file-tree/refresh", wrapRoute(async (_req, res) => {
+  const settings = getSettings(db)
+  const roots = resolveLibraryRoots(settings)
+  const foundPaths = await scanVideoFiles(roots)
+
+  const existing = new Map(getLocalFiles(db).map((file) => [file.path, file]))
+  for (const filePath of foundPaths) {
+    const previous = existing.get(filePath)
+    upsertLocalFile(db, {
+      path: filePath,
+      name: path.basename(filePath),
+      parsedInfo: previous?.parsedInfo ?? null,
+      parsedFolderInfo: previous?.parsedFolderInfo ?? null,
+      metadata: previous?.metadata ?? null,
+      locked: Boolean(previous?.locked),
+      ignored: Boolean(previous?.ignored),
+      mediaId: Number(previous?.mediaId || 0) || 0,
+    })
+  }
+
+  deleteLocalFilesNotIn(db, foundPaths)
+  res.json(dataResponse(true))
+}))
+
+app.post("/api/v1/library/explorer/directory-children", wrapRoute(async (req, res) => {
+  const directoryPath = String(req.body?.directoryPath || "").trim()
+  if (!directoryPath) throw new Error("directoryPath is required")
+  res.json(dataResponse(true))
+}))
+
+app.get("/api/v1/library/local-files", (_req, res) => {
+  res.json(dataResponse(getLocalFiles(db)))
+})
+
+app.patch("/api/v1/library/local-file", wrapRoute((req, res) => {
+  const body = req.body && typeof req.body === "object" ? req.body : {}
+  const filePath = String(body.path || "").trim()
+  if (!filePath) throw new Error("path is required")
+
+  const ok = updateLocalFile(db, {
+    path: filePath,
+    metadata: body.metadata,
+    locked: Boolean(body.locked),
+    ignored: Boolean(body.ignored),
+    mediaId: Number(body.mediaId || 0) || 0,
+  })
+
+  if (!ok) {
+    res.json(dataResponse(getLocalFiles(db)))
+    return
+  }
+  res.json(dataResponse(getLocalFiles(db)))
+}))
+
+app.post("/api/v1/library/scan", wrapRoute(async (req, res) => {
+  const body = req.body && typeof req.body === "object" ? req.body : {}
+  const skipLockedFiles = Boolean(body.skipLockedFiles)
+  const skipIgnoredFiles = Boolean(body.skipIgnoredFiles)
+
+  const settings = getSettings(db)
+  const roots = resolveLibraryRoots(settings)
+  const foundPaths = await scanVideoFiles(roots)
+
+  const existing = new Map(getLocalFiles(db).map((file) => [file.path, file]))
+  for (const filePath of foundPaths) {
+    const previous = existing.get(filePath)
+    upsertLocalFile(db, {
+      path: filePath,
+      name: path.basename(filePath),
+      parsedInfo: previous?.parsedInfo ?? null,
+      parsedFolderInfo: previous?.parsedFolderInfo ?? null,
+      metadata: previous?.metadata ?? null,
+      locked: Boolean(previous?.locked),
+      ignored: Boolean(previous?.ignored),
+      mediaId: Number(previous?.mediaId || 0) || 0,
+    })
+  }
+
+  if (!skipLockedFiles && !skipIgnoredFiles) {
+    deleteLocalFilesNotIn(db, foundPaths)
+  }
+
+  res.json(dataResponse(getLocalFiles(db)))
+}))
+
+app.get("/api/v1/library/scan-summaries", (_req, res) => {
+  res.json(dataResponse([]))
+})
+
+app.delete("/api/v1/library/empty-directories", wrapRoute(async (_req, res) => {
+  const settings = getSettings(db)
+  const roots = resolveLibraryRoots(settings)
+
+  let removed = 0
+  for (const root of roots) {
+    removed += await deleteEmptyDirectories(root)
+  }
+
+  res.json(dataResponse(true))
+}))
 
 app.get("/api/v1/library/schedule", (_req, res) => {
   res.json(dataResponse([]))
@@ -2908,5 +3044,61 @@ function normalizeEpisodeContinuity(item) {
     currentTime,
     duration,
     progress: Math.max(0, Math.min(100, (currentTime / duration) * 100)),
+  }
+}
+
+async function deleteEmptyDirectories(rootDir) {
+  const resolvedRoot = path.resolve(rootDir)
+
+  async function walk(dir) {
+    let entries
+    try {
+      entries = await fs.promises.readdir(dir, { withFileTypes: true })
+    } catch {
+      return 0
+    }
+
+    let removed = 0
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue
+      const childDir = path.join(dir, entry.name)
+      removed += await walk(childDir)
+    }
+
+    if (dir === resolvedRoot) return removed
+
+    try {
+      const remaining = await fs.promises.readdir(dir)
+      if (remaining.length === 0) {
+        await fs.promises.rmdir(dir)
+        removed += 1
+      }
+    } catch {
+    }
+
+    return removed
+  }
+
+  return walk(resolvedRoot)
+}
+
+async function tryOpenInExplorer(execFileAsync, targetPath) {
+  const resolved = path.resolve(targetPath)
+  try {
+    const stat = await fs.promises.stat(resolved)
+    const dir = stat.isDirectory() ? resolved : path.dirname(resolved)
+
+    if (process.platform === "win32") {
+      await execFileAsync("explorer.exe", [dir])
+      return true
+    }
+    if (process.platform === "darwin") {
+      await execFileAsync("open", [dir])
+      return true
+    }
+    await execFileAsync("xdg-open", [dir])
+    return true
+  } catch {
+    return false
   }
 }

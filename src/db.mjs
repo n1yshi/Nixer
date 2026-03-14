@@ -88,6 +88,19 @@ export function createDb(config) {
       updated_at TEXT NOT NULL,
       PRIMARY KEY (provider, media_id)
     );
+
+    CREATE TABLE IF NOT EXISTS local_files (
+      path TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      parsed_info_json TEXT NOT NULL DEFAULT '',
+      parsed_folder_info_json TEXT NOT NULL DEFAULT '',
+      metadata_json TEXT NOT NULL DEFAULT '',
+      locked INTEGER NOT NULL DEFAULT 0,
+      ignored INTEGER NOT NULL DEFAULT 0,
+      media_id INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
   `)
 
   migrateContinuityWatchHistoryTable(db)
@@ -479,6 +492,109 @@ export function deleteMangaMapping(db, provider, mediaId) {
   return true
 }
 
+export function getLocalFiles(db) {
+  const rows = db.prepare(`
+    SELECT
+      path,
+      name,
+      parsed_info_json,
+      parsed_folder_info_json,
+      metadata_json,
+      locked,
+      ignored,
+      media_id
+    FROM local_files
+    ORDER BY path ASC
+  `).all()
+
+  return rows.map((row) => ({
+    path: String(row.path || ""),
+    name: String(row.name || ""),
+    parsedInfo: safeJsonParse(row.parsed_info_json),
+    parsedFolderInfo: safeJsonParse(row.parsed_folder_info_json),
+    metadata: safeJsonParse(row.metadata_json),
+    locked: Boolean(row.locked),
+    ignored: Boolean(row.ignored),
+    mediaId: Number(row.media_id || 0) || 0,
+  }))
+}
+
+export function upsertLocalFile(db, localFile) {
+  const now = new Date().toISOString()
+  const file = localFile && typeof localFile === "object" ? localFile : {}
+  const payload = {
+    path: String(file.path || ""),
+    name: String(file.name || ""),
+    parsed_info_json: JSON.stringify(file.parsedInfo ?? null),
+    parsed_folder_info_json: JSON.stringify(file.parsedFolderInfo ?? null),
+    metadata_json: JSON.stringify(file.metadata ?? null),
+    locked: file.locked ? 1 : 0,
+    ignored: file.ignored ? 1 : 0,
+    media_id: Number(file.mediaId || 0) || 0,
+    created_at: now,
+    updated_at: now,
+  }
+
+  if (!payload.path) throw new Error("local file path is required")
+  if (!payload.name) payload.name = payload.path.split(/[\\/]/).pop() || payload.path
+
+  db.prepare(`
+    INSERT INTO local_files (
+      path, name, parsed_info_json, parsed_folder_info_json, metadata_json, locked, ignored, media_id, created_at, updated_at
+    ) VALUES (
+      @path, @name, @parsed_info_json, @parsed_folder_info_json, @metadata_json, @locked, @ignored, @media_id, @created_at, @updated_at
+    )
+    ON CONFLICT(path) DO UPDATE SET
+      name = excluded.name,
+      parsed_info_json = excluded.parsed_info_json,
+      parsed_folder_info_json = excluded.parsed_folder_info_json,
+      metadata_json = excluded.metadata_json,
+      locked = excluded.locked,
+      ignored = excluded.ignored,
+      media_id = excluded.media_id,
+      updated_at = excluded.updated_at
+  `).run(payload)
+}
+
+export function updateLocalFile(db, { path, metadata, locked, ignored, mediaId }) {
+  const safePath = String(path || "")
+  if (!safePath) throw new Error("path is required")
+
+  const current = db.prepare("SELECT metadata_json FROM local_files WHERE path = ?").get(safePath) || null
+  if (!current) return false
+
+  const nextMetadata = metadata !== undefined ? metadata : safeJsonParse(current.metadata_json)
+
+  db.prepare(`
+    UPDATE local_files
+    SET metadata_json = ?, locked = ?, ignored = ?, media_id = ?, updated_at = ?
+    WHERE path = ?
+  `).run(
+    JSON.stringify(nextMetadata ?? null),
+    locked ? 1 : 0,
+    ignored ? 1 : 0,
+    Number(mediaId || 0) || 0,
+    new Date().toISOString(),
+    safePath
+  )
+
+  return true
+}
+
+export function deleteLocalFilesNotIn(db, keepPaths) {
+  const keep = new Set(Array.isArray(keepPaths) ? keepPaths.map(String) : [])
+  const rows = db.prepare("SELECT path FROM local_files").all()
+  let removed = 0
+  for (const row of rows) {
+    const p = String(row.path || "")
+    if (!p) continue
+    if (keep.has(p)) continue
+    db.prepare("DELETE FROM local_files WHERE path = ?").run(p)
+    removed += 1
+  }
+  return removed
+}
+
 function shouldIgnoreContinuityRegression(existing, nextPayload) {
   if (!existing) return false
   if (Number(existing.episodeNumber || 0) !== Number(nextPayload.episode_number || 0)) return false
@@ -492,6 +608,16 @@ function shouldIgnoreContinuityRegression(existing, nextPayload) {
   if (nextDuration > 0 && nextCurrentTime >= nextDuration * 0.02) return false
 
   return true
+}
+
+function safeJsonParse(value) {
+  const text = String(value || "").trim()
+  if (!text) return null
+  try {
+    return JSON.parse(text)
+  } catch {
+    return null
+  }
 }
 
 function mapContinuityRow(row) {
